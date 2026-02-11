@@ -50,12 +50,12 @@ const TransferOptionsSchema = z.object({
     .optional()
     .default('gpt-4o-mini')
     .describe('OpenAI model to use for semantic matching'),
-  batchSize: z.number()
-    .min(1)
-    .max(500)
+  masterStartRow: z.number()
     .optional()
-    .default(60)
-    .describe('Number of items to process in each batch. If you encounter timeouts, try reducing this number.')
+    .describe('Start matching from this row in master spreadsheet (1-based)'),
+  sourceStartRow: z.number()
+    .optional()
+    .describe('Start matching from this row in source spreadsheet (1-based)')
 });
 
 const TransferDataInputSchema = z.object({
@@ -168,13 +168,8 @@ export const spreadsheetTools = {
           logger.info('Using coordinate-based mode (direct column access)');
         }
 
-        // Track row offsets for coordinate-based columns
-        const masterRowOffset = masterUsesCoordinate 
-          ? googleSheetsClient.extractRowFromCoordinate(input.masterUniqueColumn) - 1 
-          : 0;
-        const sourceRowOffset = sourceUsesCoordinate 
-          ? googleSheetsClient.extractRowFromCoordinate(input.sourceUniqueColumn) - 1 
-          : 0;
+        // Note: Row offsets are no longer needed here - we now store actual spreadsheet row numbers
+        // directly in the rowIndex field during data extraction
 
         // 1. Read both spreadsheets
         const [masterData, sourceData] = await Promise.all([
@@ -217,56 +212,108 @@ export const spreadsheetTools = {
             sourceHeader: sourceIsCoord ? mapping.sourceColumn.toUpperCase() : googleSheetsClient.getColumnHeader(mapping.sourceColumn, sourceData.headers),
             masterHeader: masterIsCoord ? mapping.masterColumn.toUpperCase() : googleSheetsClient.getColumnHeader(mapping.masterColumn, masterData.headers),
             sourceIsCoordinate: sourceIsCoord,
-            masterIsCoordinate: masterIsCoord,
-            sourceRowOffset: sourceIsCoord ? googleSheetsClient.extractRowFromCoordinate(mapping.sourceColumn) - 1 : 0,
-            masterRowOffset: masterIsCoord ? googleSheetsClient.extractRowFromCoordinate(mapping.masterColumn) - 1 : 0
+            masterIsCoordinate: masterIsCoord
           };
         });
 
         logger.info('Resolved column identifiers', {
-          masterUnique: { input: input.masterUniqueColumn, resolved: masterUniqueHeader, isCoordinate: masterUsesCoordinate, rowOffset: masterRowOffset },
-          sourceUnique: { input: input.sourceUniqueColumn, resolved: sourceUniqueHeader, isCoordinate: sourceUsesCoordinate, rowOffset: sourceRowOffset },
+          masterUnique: { input: input.masterUniqueColumn, resolved: masterUniqueHeader, isCoordinate: masterUsesCoordinate },
+          sourceUnique: { input: input.sourceUniqueColumn, resolved: sourceUniqueHeader, isCoordinate: sourceUsesCoordinate },
           valueColumns: resolvedMappings.map(m => ({
-            source: { input: m.original.sourceColumn, resolved: m.sourceHeader, isCoordinate: m.sourceIsCoordinate, rowOffset: m.sourceRowOffset },
-            master: { input: m.original.masterColumn, resolved: m.masterHeader, isCoordinate: m.masterIsCoordinate, rowOffset: m.masterRowOffset }
+            source: { input: m.original.sourceColumn, resolved: m.sourceHeader, isCoordinate: m.sourceIsCoordinate },
+            master: { input: m.original.masterColumn, resolved: m.masterHeader, isCoordinate: m.masterIsCoordinate }
           }))
         });
 
-        // 3. Extract unique values - for coordinates, read column directly
+        // 3. Extract unique values with ACTUAL SPREADSHEET ROW NUMBERS
+        // rowIndex will store the actual spreadsheet row (1-based), NOT array index
         let masterValues: Array<{ value: string; rowIndex: number }>;
         let sourceValues: Array<{ value: string; rowIndex: number }>;
+        let masterStartRow: number;
+        let sourceStartRow: number;
 
         if (masterUsesCoordinate) {
           // Read column data directly by coordinate
-          const masterColumnData = await googleSheetsClient.readColumnByCoordinate(input.masterSpreadsheetUrl, input.masterUniqueColumn);
-          masterValues = masterColumnData.map((value, index) => ({
+          // D4 means start from row 4, B2 means start from row 2
+          const result = await googleSheetsClient.readColumnByCoordinate(input.masterSpreadsheetUrl, input.masterUniqueColumn);
+          masterStartRow = result.startRow;
+          
+          masterValues = result.values.map((value, index) => ({
             value: String(value ?? ''),
-            rowIndex: index
+            // Actual spreadsheet row number = startRow + index
+            rowIndex: masterStartRow + index
           })).filter(item => item.value !== '');
+          
+          logger.info('Read master column by coordinate', {
+            coordinate: input.masterUniqueColumn,
+            startRow: masterStartRow,
+            totalValues: result.values.length,
+            nonEmptyValues: masterValues.length,
+            sampleValues: masterValues.slice(0, 5).map(v => ({ value: v.value.substring(0, 50), row: v.rowIndex }))
+          });
         } else {
+          // For header-based mode, data starts after header row
+          masterStartRow = masterData.headerRowIndex + 2; // headerRowIndex is 0-based, +1 for 1-based, +1 to skip header
+          
           masterValues = masterData.rows.map((row, index) => ({
             value: String(row[masterUniqueHeader] ?? ''),
-            rowIndex: index
+            // Actual spreadsheet row number
+            rowIndex: masterStartRow + index
           })).filter(item => item.value !== '');
+          
+          logger.info('Read master column by header', {
+            header: masterUniqueHeader,
+            startRow: masterStartRow,
+            totalRows: masterData.rows.length,
+            nonEmptyValues: masterValues.length
+          });
         }
 
         if (sourceUsesCoordinate) {
-          const sourceColumnData = await googleSheetsClient.readColumnByCoordinate(input.sourceSpreadsheetUrl, input.sourceUniqueColumn);
-          sourceValues = sourceColumnData.map((value, index) => ({
+          const result = await googleSheetsClient.readColumnByCoordinate(input.sourceSpreadsheetUrl, input.sourceUniqueColumn);
+          sourceStartRow = result.startRow;
+          
+          sourceValues = result.values.map((value, index) => ({
             value: String(value ?? ''),
-            rowIndex: index
+            rowIndex: sourceStartRow + index
           })).filter(item => item.value !== '');
+          
+          logger.info('Read source column by coordinate', {
+            coordinate: input.sourceUniqueColumn,
+            startRow: sourceStartRow,
+            totalValues: result.values.length,
+            nonEmptyValues: sourceValues.length,
+            sampleValues: sourceValues.slice(0, 5).map(v => ({ value: v.value.substring(0, 50), row: v.rowIndex }))
+          });
         } else {
+          sourceStartRow = sourceData.headerRowIndex + 2;
+          
           sourceValues = sourceData.rows.map((row, index) => ({
             value: String(row[sourceUniqueHeader] ?? ''),
-            rowIndex: index
+            rowIndex: sourceStartRow + index
           })).filter(item => item.value !== '');
+          
+          logger.info('Read source column by header', {
+            header: sourceUniqueHeader,
+            startRow: sourceStartRow,
+            totalRows: sourceData.rows.length,
+            nonEmptyValues: sourceValues.length
+          });
         }
 
         logger.info('Extracted unique values', {
           masterCount: masterValues.length,
-          sourceCount: sourceValues.length
+          sourceCount: sourceValues.length,
+          masterRowRange: masterValues.length > 0 
+            ? `${masterValues[0].rowIndex} - ${masterValues[masterValues.length - 1].rowIndex}` 
+            : 'none',
+          sourceRowRange: sourceValues.length > 0 
+            ? `${sourceValues[0].rowIndex} - ${sourceValues[sourceValues.length - 1].rowIndex}` 
+            : 'none'
         });
+
+        // Note: We no longer need options.masterStartRow or options.sourceStartRow
+        // because the start row is already determined by the coordinate (D4 = row 4)
 
         // 4. Perform semantic matching
         const options = input.options || {};
@@ -274,11 +321,15 @@ export const spreadsheetTools = {
           masterValues,
           sourceValues,
           options.confidenceThreshold ?? 0.8,
-          options.matchModel ?? 'gpt-4o-mini',
-          options.batchSize ?? 60
+          options.matchModel ?? 'gpt-4o-mini'
         );
 
         // 5. Prepare data transfers
+        // IMPORTANT: match.masterRowIndex and match.sourceRowIndex are now ACTUAL SPREADSHEET ROW NUMBERS (1-based)
+        // For example, if user specified D4 for master and B2 for source:
+        // - masterRowIndex might be 4, 5, 6, 7... (actual rows in spreadsheet)
+        // - sourceRowIndex might be 2, 3, 4, 5... (actual rows in spreadsheet)
+        
         const mappings: Array<{
           masterValue: string;
           sourceValue: string;
@@ -288,39 +339,85 @@ export const spreadsheetTools = {
 
         const updates: Array<{ rowIndex: number; columnName: string; value: string | number | null }> = [];
 
-        // For coordinate mode, cache column data
-        const sourceColumnCache: Map<string, string[]> = new Map();
+        // For coordinate mode, cache column data with their start rows
+        const sourceColumnCache: Map<string, { values: string[]; startRow: number }> = new Map();
         
         for (const resolvedMapping of resolvedMappings) {
           if (resolvedMapping.sourceIsCoordinate) {
-            const columnData = await googleSheetsClient.readColumnByCoordinate(input.sourceSpreadsheetUrl, resolvedMapping.sourceHeader);
-            sourceColumnCache.set(resolvedMapping.sourceHeader, columnData);
+            const result = await googleSheetsClient.readColumnByCoordinate(input.sourceSpreadsheetUrl, resolvedMapping.sourceHeader);
+            sourceColumnCache.set(resolvedMapping.sourceHeader, result);
           }
         }
 
         for (const match of matches) {
-          const sourceRow = sourceData.rows[match.sourceRowIndex];
+          // match.sourceRowIndex is ACTUAL SPREADSHEET ROW NUMBER (e.g., 2, 3, 4...)
+          // To access sourceData.rows, we need to convert to 0-based index from data start
+          const sourceDataArrayIndex = match.sourceRowIndex - sourceStartRow;
+          
+          // Safely access source row
+          const sourceRow = sourceDataArrayIndex >= 0 && sourceDataArrayIndex < sourceData.rows.length 
+            ? sourceData.rows[sourceDataArrayIndex] 
+            : undefined;
+            
           const valuesToTransfer: Record<string, string | number | null> = {};
+
+          logger.debug('Processing match', {
+            masterValue: match.masterValue,
+            sourceValue: match.sourceValue,
+            masterRowIndex: match.masterRowIndex,
+            sourceRowIndex: match.sourceRowIndex,
+            sourceStartRow,
+            sourceDataArrayIndex,
+            hasSourceRow: !!sourceRow
+          });
 
           for (const resolvedMapping of resolvedMappings) {
             let sourceValue: string | number | null;
             
             if (resolvedMapping.sourceIsCoordinate) {
               // Read from cached column data
-              const columnData = sourceColumnCache.get(resolvedMapping.sourceHeader);
-              sourceValue = columnData?.[match.sourceRowIndex] ?? null;
+              // Cache startRow might be different from unique column startRow
+              const cacheData = sourceColumnCache.get(resolvedMapping.sourceHeader);
+              if (cacheData) {
+                // Convert actual row number to array index in this specific cache
+                const cacheArrayIndex = match.sourceRowIndex - cacheData.startRow;
+                sourceValue = cacheArrayIndex >= 0 && cacheArrayIndex < cacheData.values.length 
+                  ? cacheData.values[cacheArrayIndex] 
+                  : null;
+                
+                logger.debug('Reading from coordinate cache', {
+                  column: resolvedMapping.sourceHeader,
+                  sourceRowIndex: match.sourceRowIndex,
+                  cacheStartRow: cacheData.startRow,
+                  cacheArrayIndex,
+                  cacheSize: cacheData.values.length,
+                  foundValue: sourceValue
+                });
+              } else {
+                sourceValue = null;
+              }
             } else {
               // Read from row object
-              sourceValue = sourceRow[resolvedMapping.sourceHeader] ?? null;
+              if (!sourceRow) {
+                logger.warn('Source row not found', {
+                  sourceRowIndex: match.sourceRowIndex,
+                  sourceStartRow,
+                  sourceDataArrayIndex,
+                  totalRows: sourceData.rows.length
+                });
+                sourceValue = null;
+              } else {
+                sourceValue = sourceRow[resolvedMapping.sourceHeader] ?? null;
+              }
             }
             
             valuesToTransfer[resolvedMapping.masterHeader] = sourceValue ?? null;
 
             if (!options.dryRun) {
-              // Adjust rowIndex for master column row offset
-              const actualRowIndex = match.masterRowIndex + masterRowOffset;
+              // match.masterRowIndex is ALREADY the actual spreadsheet row number
+              // We pass it directly - updateSpreadsheet will use it as-is
               updates.push({
-                rowIndex: actualRowIndex,
+                rowIndex: match.masterRowIndex,
                 columnName: resolvedMapping.masterHeader,
                 value: sourceValue ?? null
               });
@@ -337,12 +434,19 @@ export const spreadsheetTools = {
 
         // 6. Execute updates if not dry run
         if (!options.dryRun && updates.length > 0) {
-          // Determine base row index for master updates
-          // If master uses coordinate, base is the starting row of the coordinate
-          // Otherwise, base is 2 (skip header row)
-          const masterBaseRow = masterUsesCoordinate 
-            ? masterRowOffset + 1 
-            : 2;
+          // updates[].rowIndex is now the ACTUAL spreadsheet row number (1-based)
+          // We need to pass baseRowIndex = 0 so that: apiRowIndex = 0 + rowIndex = rowIndex
+          // This way the actual row number is used directly
+          const masterBaseRow = 0;  // rowIndex is already the actual row number
+          
+          logger.info('Executing spreadsheet updates', {
+            updateCount: updates.length,
+            sampleUpdates: updates.slice(0, 5).map(u => ({
+              targetRow: u.rowIndex,
+              column: u.columnName,
+              value: u.value
+            }))
+          });
           
           await googleSheetsClient.updateSpreadsheet(
             input.masterSpreadsheetUrl,

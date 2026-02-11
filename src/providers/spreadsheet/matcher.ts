@@ -3,23 +3,27 @@ import { config } from '../../config/index.js';
 import { mcpLogger as logger } from '../../utils/logger.js';
 import { MatchResult, UnmatchedItem } from './types.js';
 
-interface LLMMatch {
-  masterValue: string;
-  sourceValue: string;
+/**
+ * NEW APPROACH:
+ * 1. Send source values and master values to LLM
+ * 2. LLM returns for each source value: the EXACT master value that has same meaning (or null if no match)
+ * 3. We then do EXACT STRING MATCHING to find the master row
+ * 
+ * This eliminates issues with:
+ * - LLM returning slightly different values
+ * - Normalized matching not finding items
+ * - Complex row index calculations
+ */
+
+interface NormalizedSourceItem {
+  originalSourceValue: string;
+  normalizedToMaster: string | null;  // Exact master value if matched, null if no match
   confidence: number;
   reasoning: string;
 }
 
-interface LLMResponse {
-  matches: LLMMatch[];
-  unmatched: Array<{
-    sourceValue: string;
-    reason: string;
-    bestCandidate?: {
-      value: string;
-      confidence: number;
-    };
-  }>;
+interface LLMNormalizationResponse {
+  normalizedItems: NormalizedSourceItem[];
 }
 
 export class SemanticMatcher {
@@ -27,34 +31,70 @@ export class SemanticMatcher {
 
   constructor() {
     this.openai = new OpenAI({
-      apiKey: config.openai.apiKey
+      apiKey: config.openai.apiKey,
+      timeout: 30 * 60 * 1000 // 30 minutes timeout
     });
   }
 
   /**
-   * Perform semantic matching between master and source values using LLM
+   * Build a map from master values to their row indices for fast lookup
+   */
+  private buildMasterValueMap(masterValues: Array<{ value: string; rowIndex: number }>): Map<string, number> {
+    const map = new Map<string, number>();
+    for (const item of masterValues) {
+      // Store with exact value as key
+      map.set(item.value, item.rowIndex);
+    }
+    return map;
+  }
+
+  /**
+   * Perform semantic matching using the new "normalize to master" approach
    */
   async matchValues(
     masterValues: Array<{ value: string; rowIndex: number }>,
     sourceValues: Array<{ value: string; rowIndex: number }>,
     confidenceThreshold: number = 0.8,
-    model: string = 'gpt-4o-mini',
-    batchSize: number = 60
+    model: string = 'gpt-4o-mini'
   ): Promise<{ matches: MatchResult[]; unmatched: UnmatchedItem[] }> {
-    logger.info('Starting semantic matching', {
+    logger.info('Starting semantic matching (normalize-to-master approach)', {
       masterCount: masterValues.length,
       sourceCount: sourceValues.length,
-      threshold: confidenceThreshold,
-      batchSize
+      threshold: confidenceThreshold
     });
 
-    // Extract values for LLM (master values are needed for every batch)
+    // Build lookup map for master values
+    const masterValueMap = this.buildMasterValueMap(masterValues);
     const masterValueList = masterValues.map(m => m.value);
 
-    // Helper to process a single batch
-    const processBatch = async (batchSourceValues: Array<{ value: string; rowIndex: number }>, batchIndex: number) => {
-      const sourceValueList = batchSourceValues.map(s => s.value);
-      const prompt = this.buildMatchingPrompt(masterValueList, sourceValueList, confidenceThreshold);
+    const BATCH_SIZE = 20;
+    const CONCURRENCY_LIMIT = 50;
+    
+    // Create batch definitions
+    interface BatchDefinition {
+      sourceBatch: Array<{ value: string; rowIndex: number }>;
+      batchNumber: number;
+    }
+    const batchDefinitions: BatchDefinition[] = [];
+
+    for (let i = 0; i < sourceValues.length; i += BATCH_SIZE) {
+      batchDefinitions.push({
+        sourceBatch: sourceValues.slice(i, i + BATCH_SIZE),
+        batchNumber: Math.floor(i / BATCH_SIZE) + 1
+      });
+    }
+
+    const totalBatches = batchDefinitions.length;
+    const allMatches: MatchResult[] = [];
+    const allUnmatched: UnmatchedItem[] = [];
+
+    // Define the processor function
+    const processBatch = async ({ sourceBatch, batchNumber }: BatchDefinition) => {
+      logger.info(`Processing batch ${batchNumber}/${totalBatches}`, {
+        batchSize: sourceBatch.length
+      });
+
+      const sourceValueList = sourceBatch.map(s => s.value);
 
       try {
         const response = await this.openai.chat.completions.create({
@@ -62,28 +102,45 @@ export class SemanticMatcher {
           messages: [
             {
               role: 'system',
-              content: `You are a semantic matching assistant. Your task is to match values from a source list to a master list based on semantic similarity and meaning, not just string equality. 
+              content: `You are a data normalization assistant. Your task is to match source values to master values based on semantic meaning.
 
-Rules:
-1. Consider variations in formatting, prefixes, suffixes, abbreviations, and spelling differences
-2. Examples of valid matches:
-   - "kota Surabaya" ≈ "Surabaya" (confidence: 0.95)
-   - "DKI Jakarta" ≈ "Jakarta" (confidence: 0.90)
-   - "Product A-123" ≈ "A123" (confidence: 0.85)
-   - "John Smith Jr." ≈ "Smith, John" (confidence: 0.88)
-   - "PT. ABC Indonesia" ≈ "ABC Indonesia" (confidence: 0.92)
-   - "New York City" ≈ "NYC" (confidence: 0.85)
+TASK:
+For each SOURCE value, find the MASTER value that has the SAME MEANING and return the EXACT master value string.
 
-3. Each match must have a confidence score between 0 and 1
-4. Only return matches with confidence >= threshold
-5. For unmatched items, provide the best candidate if one exists
-6. Be precise - don't match completely different values
+RULES:
+1. If a source value has the same meaning as a master value, return the EXACT master value string (copy-paste it exactly)
+2. If no master value matches the meaning, return null
+3. Consider variations like:
+   - Prefixes/suffixes: "IKP 24.2 Persentase..." matches "Persentase..."
+   - Case differences: "JAKARTA" matches "Jakarta"
+   - Abbreviations: "DKI Jakarta" matches "Jakarta" 
+   - Formatting: "PT. ABC" matches "ABC"
+   - Typos or slight variations in spelling
+4. Assign confidence score (0-1) for each match
+5. Only match if confidence >= ${confidenceThreshold}
+6. CRITICAL: The normalizedToMaster value MUST be an EXACT copy from the master list, or null. Do not modify, trim, or alter the master value in any way.
 
-Return ONLY valid JSON in the specified format.`
+Return JSON format:
+{
+  "normalizedItems": [
+    {
+      "originalSourceValue": "exact source value",
+      "normalizedToMaster": "exact master value or null",
+      "confidence": 0.95,
+      "reasoning": "brief explanation"
+    }
+  ]
+}`
             },
             {
               role: 'user',
-              content: prompt
+              content: `MASTER VALUES (${masterValueList.length} items):
+${JSON.stringify(masterValueList, null, 2)}
+
+SOURCE VALUES to normalize (${sourceValueList.length} items):
+${JSON.stringify(sourceValueList, null, 2)}
+
+For each source value, return the EXACT matching master value or null if no match.`
             }
           ],
           temperature: 0.1,
@@ -92,130 +149,123 @@ Return ONLY valid JSON in the specified format.`
 
         const content = response.choices[0]?.message?.content;
         if (!content) {
-          throw new Error(`Empty response from OpenAI for batch ${batchIndex}`);
+          throw new Error('Empty response from OpenAI');
         }
 
-        const llmResult: LLMResponse = JSON.parse(content);
-        return llmResult;
+        const llmResult: LLMNormalizationResponse = JSON.parse(content);
+
+        const batchMatches: MatchResult[] = [];
+        const batchUnmatched: UnmatchedItem[] = [];
+
+        for (const item of llmResult.normalizedItems) {
+          // Find the original source item
+          const sourceItem = sourceBatch.find(s => s.value === item.originalSourceValue);
+          
+          if (!sourceItem) {
+            logger.warn('LLM returned item not found in source batch', {
+              originalSourceValue: item.originalSourceValue,
+              availableSourceValues: sourceBatch.slice(0, 3).map(s => s.value)
+            });
+            continue;
+          }
+
+          if (item.normalizedToMaster && item.confidence >= confidenceThreshold) {
+            // Look up master row using EXACT STRING MATCH
+            const masterRowIndex = masterValueMap.get(item.normalizedToMaster);
+
+            if (masterRowIndex !== undefined) {
+              batchMatches.push({
+                masterValue: item.normalizedToMaster,
+                sourceValue: item.originalSourceValue,
+                confidence: item.confidence,
+                masterRowIndex: masterRowIndex,
+                sourceRowIndex: sourceItem.rowIndex
+              });
+
+              logger.debug('Match found', {
+                source: item.originalSourceValue.substring(0, 50),
+                master: item.normalizedToMaster.substring(0, 50),
+                confidence: item.confidence,
+                masterRow: masterRowIndex,
+                sourceRow: sourceItem.rowIndex
+              });
+            } else {
+              // LLM returned a master value that doesn't exist in our list
+              logger.warn('LLM returned master value not found in master list', {
+                returnedMasterValue: item.normalizedToMaster,
+                sourceValue: item.originalSourceValue,
+                confidence: item.confidence
+              });
+              
+              batchUnmatched.push({
+                sourceValue: item.originalSourceValue,
+                sourceRowIndex: sourceItem.rowIndex,
+                reason: `LLM suggested "${item.normalizedToMaster}" but it was not found in master list`,
+                bestCandidate: {
+                  value: item.normalizedToMaster,
+                  confidence: item.confidence
+                }
+              });
+            }
+          } else {
+            // No match or below threshold
+            batchUnmatched.push({
+              sourceValue: item.originalSourceValue,
+              sourceRowIndex: sourceItem.rowIndex,
+              reason: item.normalizedToMaster 
+                ? `Confidence ${item.confidence} below threshold ${confidenceThreshold}: ${item.reasoning}`
+                : `No matching master value: ${item.reasoning}`,
+              bestCandidate: item.normalizedToMaster ? {
+                value: item.normalizedToMaster,
+                confidence: item.confidence
+              } : undefined
+            });
+          }
+        }
+
+        // Check if all source items were processed
+        const processedSourceValues = new Set(llmResult.normalizedItems.map(i => i.originalSourceValue));
+        for (const sourceItem of sourceBatch) {
+          if (!processedSourceValues.has(sourceItem.value)) {
+            logger.warn('Source item not processed by LLM', {
+              sourceValue: sourceItem.value
+            });
+            batchUnmatched.push({
+              sourceValue: sourceItem.value,
+              sourceRowIndex: sourceItem.rowIndex,
+              reason: 'Not processed by LLM'
+            });
+          }
+        }
+
+        return { matches: batchMatches, unmatched: batchUnmatched };
+
       } catch (error) {
-        logger.error(`Error processing batch ${batchIndex}`, { error });
-        throw error;
+        logger.error(`Error in semantic matching batch ${batchNumber}`, { error });
+        throw new Error(`Semantic matching failed for batch ${batchNumber}: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     };
 
-    // Split sourceValues into chunks
-    const chunks: Array<Array<{ value: string; rowIndex: number }>> = [];
-    for (let i = 0; i < sourceValues.length; i += batchSize) {
-      chunks.push(sourceValues.slice(i, i + batchSize));
-    }
-
-    logger.info(`Split ${sourceValues.length} source items into ${chunks.length} batches`);
-
-    // Process chunks with concurrency limit
-    const CONCURRENCY_LIMIT = 3;
-    const allMatches: MatchResult[] = [];
-    const allUnmatched: UnmatchedItem[] = [];
-
-    for (let i = 0; i < chunks.length; i += CONCURRENCY_LIMIT) {
-      const batchPromises = chunks.slice(i, i + CONCURRENCY_LIMIT).map(async (chunk, idx) => {
-        const result = await processBatch(chunk, i + idx);
-        
-        // Map results back to original objects
-        const matches: MatchResult[] = result.matches.map(match => {
-          const masterItem = masterValues.find(m => m.value === match.masterValue);
-          const sourceItem = chunk.find(s => s.value === match.sourceValue);
-
-          if (!masterItem || !sourceItem) return null;
-
-          return {
-            masterValue: match.masterValue,
-            sourceValue: match.sourceValue,
-            confidence: match.confidence,
-            masterRowIndex: masterItem.rowIndex,
-            sourceRowIndex: sourceItem.rowIndex
-          };
-        }).filter((m): m is MatchResult => m !== null);
-
-        const unmatched: UnmatchedItem[] = result.unmatched.map(item => {
-          const sourceItem = chunk.find(s => s.value === item.sourceValue);
-          return {
-            sourceValue: item.sourceValue,
-            sourceRowIndex: sourceItem?.rowIndex ?? -1,
-            reason: item.reason,
-            bestCandidate: item.bestCandidate
-          };
-        });
-
-        return { matches, unmatched };
-      });
-
-      const batchResults = await Promise.all(batchPromises);
+    // Execute in chunks to respect concurrency limit
+    for (let i = 0; i < batchDefinitions.length; i += CONCURRENCY_LIMIT) {
+      const chunk = batchDefinitions.slice(i, i + CONCURRENCY_LIMIT);
+      const results = await Promise.all(chunk.map(processBatch));
       
-      batchResults.forEach(res => {
+      results.forEach(res => {
         allMatches.push(...res.matches);
         allUnmatched.push(...res.unmatched);
       });
-      
-      logger.info(`Processed batches ${i + 1} to ${Math.min(i + CONCURRENCY_LIMIT, chunks.length)}`);
     }
 
     logger.info('Semantic matching completed', {
-      matchesFound: allMatches.length,
-      unmatchedCount: allUnmatched.length,
-      avgConfidence: allMatches.length > 0 
-        ? allMatches.reduce((sum, m) => sum + m.confidence, 0) / allMatches.length 
-        : 0
+      totalMatches: allMatches.length,
+      totalUnmatched: allUnmatched.length,
+      avgConfidence: allMatches.length > 0 ? allMatches.reduce((sum, m) => sum + m.confidence, 0) / allMatches.length : 0,
+      matchedMasterValues: allMatches.map(m => m.masterValue.substring(0, 30)),
+      sampleUnmatched: allUnmatched.slice(0, 5).map(u => ({ value: u.sourceValue.substring(0, 30), reason: u.reason }))
     });
 
     return { matches: allMatches, unmatched: allUnmatched };
-  }
-
-  /**
-   * Build the matching prompt for the LLM
-   */
-  private buildMatchingPrompt(
-    masterValues: string[],
-    sourceValues: string[],
-    threshold: number
-  ): string {
-    return `Match values from the SOURCE list to the MASTER list.
-
-MASTER values (${masterValues.length} items):
-${JSON.stringify(masterValues, null, 2)}
-
-SOURCE values (${sourceValues.length} items):
-${JSON.stringify(sourceValues, null, 2)}
-
-Confidence threshold: ${threshold}
-
-Task:
-1. For each SOURCE value, find the best matching MASTER value based on semantic meaning
-2. Consider formatting differences, abbreviations, prefixes, suffixes
-3. Assign a confidence score (0-1) to each match
-4. Only include matches with confidence >= ${threshold}
-5. Source values that don't match any master value should be in "unmatched"
-
-Return JSON in this exact format:
-{
-  "matches": [
-    {
-      "masterValue": "exact master value",
-      "sourceValue": "exact source value",
-      "confidence": 0.95,
-      "reasoning": "brief explanation"
-    }
-  ],
-  "unmatched": [
-    {
-      "sourceValue": "source value that didn't match",
-      "reason": "why it didn't match",
-      "bestCandidate": {
-        "value": "closest master value if any",
-        "confidence": 0.45
-      }
-    }
-  ]
-}`;
   }
 
   /**
@@ -226,7 +276,7 @@ Return JSON in this exact format:
     masterValues: string[],
     sourceValues: string[],
     model: string = 'gpt-4o-mini'
-  ): Promise<{ sampleMatches: LLMMatch[]; estimatedAccuracy: number }> {
+  ): Promise<{ sampleMatches: Array<{ masterValue: string; sourceValue: string; confidence: number; reasoning: string }>; estimatedAccuracy: number }> {
     const prompt = `Preview semantic matching between these lists:
 
 MASTER (${masterValues.length} items): ${JSON.stringify(masterValues.slice(0, 10))}${masterValues.length > 10 ? '...' : ''}

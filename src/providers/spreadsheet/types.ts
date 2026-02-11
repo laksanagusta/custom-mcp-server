@@ -30,7 +30,8 @@ export interface TransferOptions {
   dryRun?: boolean;
   confidenceThreshold?: number;
   matchModel?: string;
-  batchSize?: number;
+  masterStartRow?: number;
+  sourceStartRow?: number;
 }
 
 export interface TransferResult {
@@ -58,6 +59,7 @@ export interface SheetData {
   sheetName: string;
   headers: string[];
   rows: SpreadsheetRow[];
+  headerRowIndex: number;
 }
 
 export interface ColumnData {

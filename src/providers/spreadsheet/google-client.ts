@@ -139,18 +139,30 @@ export class GoogleSheetsClient {
 
   /**
    * Read specific column data by coordinate (e.g., "D", "AA", "A2", "B5")
-   * If coordinate includes row (e.g., "A2"), reads from that row onwards
-   * If coordinate is just column (e.g., "A"), reads from row 1 onwards
-   * Returns all values in that column from the specified row
+   * If coordinate includes row (e.g., "D4"), reads from that row onwards
+   * If coordinate is just column (e.g., "D"), reads from row 1 onwards
+   * 
+   * Returns object with:
+   * - values: array of string values
+   * - startRow: the actual spreadsheet row number where reading started (1-based)
    */
-  async readColumnByCoordinate(url: string, columnCoordinate: string): Promise<string[]> {
+  async readColumnByCoordinate(url: string, columnCoordinate: string): Promise<{ values: string[]; startRow: number }> {
     try {
       const spreadsheetId = this.extractSpreadsheetId(url);
       
       // Parse coordinate to get column and optional start row
       const cellRef = this.parseCellCoordinate(columnCoordinate);
       const column = cellRef ? cellRef.column : columnCoordinate.toUpperCase().trim();
+      // If user specifies D4, start from row 4. If just D, start from row 1.
       const startRow = cellRef ? cellRef.row : 1;
+      
+      // Get spreadsheet metadata to find first sheet
+      const spreadsheet = await this.sheets.spreadsheets.get({
+        spreadsheetId,
+        key: config.googleSheets.apiKey
+      });
+
+      const sheetName = spreadsheet.data.sheets?.[0]?.properties?.title || 'Sheet1';
       
       logger.info('Reading column by coordinate', { 
         spreadsheetId, 
@@ -159,31 +171,26 @@ export class GoogleSheetsClient {
         originalInput: columnCoordinate 
       });
 
-      // Get spreadsheet metadata to find the first sheet
-      const spreadsheet = await this.sheets.spreadsheets.get({
-        spreadsheetId,
-        key: config.googleSheets.apiKey
-      });
-
-      const sheetName = spreadsheet.data.sheets?.[0]?.properties?.title || 'Sheet1';
-
-      // Build range with optional start row
-      const range = startRow > 1 ? `${sheetName}!${column}${startRow}:${column}` : `${sheetName}!${column}:${column}`;
+      // Build range: e.g., "Sheet1!D4:D"
+      const range = `${sheetName}!${column}${startRow}:${column}`;
 
       // Get specific column values
       const response = await this.sheets.spreadsheets.values.get({
         spreadsheetId,
-        range: range,
+        range,
         key: config.googleSheets.apiKey
       });
 
       const values = response.data.values;
       if (!values || values.length === 0) {
-        return [];
+        return { values: [], startRow };
       }
 
-      // Flatten the array - keep empty strings for alignment
-      return values.map(row => row[0] || '');
+      // Flatten array - keep empty strings for alignment
+      return {
+        values: values.map(row => row[0] !== undefined ? String(row[0]) : ''),
+        startRow
+      };
     } catch (error) {
       logger.error('Error reading column by coordinate', { error, url, column: columnCoordinate });
       throw new Error(`Failed to read column ${columnCoordinate}: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -265,7 +272,8 @@ export class GoogleSheetsClient {
         spreadsheetId,
         sheetName,
         headers,
-        rows
+        rows,
+        headerRowIndex
       };
     } catch (error) {
       logger.error('Error reading spreadsheet', { error, url });
@@ -275,15 +283,20 @@ export class GoogleSheetsClient {
 
   /**
    * Write data to spreadsheet (update existing rows) - Requires OAuth
-   * rowIndex can be:
-   * - 0-based index from readSpreadsheet (assumes data starts at row 2)
-   * - 0-based index from coordinate-based reading (assumes data starts at the specified row)
+   * 
+   * @param updates - Array of updates. Each update.rowIndex can be:
+   *   - A 0-based index (when baseRowIndex is set to the actual start row)
+   *   - An ACTUAL spreadsheet row number (when baseRowIndex is set to 0)
+   * @param baseRowIndex - The row number to add to each rowIndex:
+   *   - If updates use 0-based indices: set to the actual start row number
+   *   - If updates use actual row numbers: set to 0
+   *   Final row = baseRowIndex + rowIndex
    */
   async updateSpreadsheet(
     url: string,
     sheetData: SheetData,
     updates: Array<{ rowIndex: number; columnName: string; value: string | number | null }>,
-    baseRowIndex: number = 1  // The row number that corresponds to rowIndex 0
+    baseRowIndex: number = 1  // Set to 0 if rowIndex is already the actual spreadsheet row number
   ): Promise<void> {
     try {
       const spreadsheetId = this.extractSpreadsheetId(url);
