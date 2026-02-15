@@ -24,6 +24,9 @@ export interface AppConfig {
   openai: {
     apiKey: string;
   };
+  gemini: {
+    apiKey: string;
+  };
 }
 
 function getEnvVar(name: string, required: boolean = true): string {
@@ -57,5 +60,8 @@ export const config: AppConfig = {
   },
   openai: {
     apiKey: getEnvVar('OPENAI_API_KEY')
+  },
+  gemini: {
+    apiKey: getEnvVar('GEMINI_API_KEY')
   }
 };

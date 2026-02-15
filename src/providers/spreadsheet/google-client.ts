@@ -62,7 +62,8 @@ export class GoogleSheetsClient {
     const authUrl = this.oauth2Client.generateAuthUrl({
       access_type: 'offline',
       scope: scopes,
-      include_granted_scopes: true
+      include_granted_scopes: true,
+      prompt: 'consent'
     });
 
     logger.info('Generated OAuth URL', { url: authUrl });

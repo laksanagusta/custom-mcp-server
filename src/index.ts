@@ -6,6 +6,8 @@ import express, { Request, Response } from 'express';
 import { zoomTools } from './tools/zoom-tools.js';
 import { githubTools } from './tools/github-tools.js';
 import { spreadsheetTools } from './tools/spreadsheet-tools.js';
+import { documentReviewTools } from './tools/document-review-tools.js';
+import { geminiFileSearchTools } from './tools/gemini-file-search-tools.js';
 import { mcpLogger as logger } from './utils/logger.js';
 import { googleSheetsClient } from './providers/spreadsheet/google-client.js';
 
@@ -26,18 +28,21 @@ async function main() {
     });
 
     // Register all tools
-    const allTools = { ...zoomTools, ...githubTools, ...spreadsheetTools };
+    const allTools = { ...zoomTools, ...githubTools, ...spreadsheetTools, ...documentReviewTools, ...geminiFileSearchTools };
 
     for (const [toolName, toolDef] of Object.entries(allTools)) {
+      const toolConfig: Record<string, unknown> = {
+        title: toolName,
+        description: toolDef.description,
+        inputSchema: toolDef.inputSchema,
+      };
+      if ('outputSchema' in toolDef && toolDef.outputSchema) {
+        toolConfig.outputSchema = toolDef.outputSchema;
+      }
       server.registerTool(
         toolName,
-        {
-          title: toolName,
-          description: toolDef.description,
-          inputSchema: toolDef.inputSchema,
-          outputSchema: toolDef.outputSchema,
-        },
-        toolDef.handler
+        toolConfig as any,
+        toolDef.handler as any
       );
     }
 
@@ -63,7 +68,14 @@ async function main() {
     // Log Spreadsheet tools
     const spreadsheetToolNames = Object.keys(spreadsheetTools);
     logger.info(`  Spreadsheet tools (${spreadsheetToolNames.length}): ${spreadsheetToolNames.join(', ')}`);
-
+    
+    // Log Document Review tools
+    const docReviewToolNames = Object.keys(documentReviewTools);
+    logger.info(`  Document Review tools (${docReviewToolNames.length}): ${docReviewToolNames.join(', ')}`);
+    
+    // Log Gemini File Search tools
+    const geminiToolNames = Object.keys(geminiFileSearchTools);
+    logger.info(`  Gemini File Search tools (${geminiToolNames.length}): ${geminiToolNames.join(', ')}`);
     // Check if OAuth is configured
     if (googleSheetsClient.isOAuthConfigured()) {
       if (googleSheetsClient.isAuthenticated()) {
